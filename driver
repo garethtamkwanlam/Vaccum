@@ -1,0 +1,833 @@
+#! /usr/bin/expect --
+
+# displayed width is 2x cMax because we add blank columns between used columns
+proc rMaxPick args { random 12 18 } ;# max rows, including walls
+proc cMaxPick args { random 12 18 } ;# max cols, including walls
+
+# the last one will be the one that is in effect
+proc showAll ids { uplevel { showAll1 $ids } } ;# one-up
+proc showAll ids { uplevel { showAll2 $ids } } ;# two-up
+proc showAll ids { uplevel { showAll3 $ids } } ;# three-up
+proc showAll ids { uplevel { showAll4 $ids } } ;# four-up
+
+# Vacuum Driver, for robotic vacuums cleaning arbitrary rooms
+# written by Don Colton
+# argv is the list of executible agent programs (non-numeric names)
+# argv may (but need not) contain a numeric random number seed
+# we spawn each agent and communicate through stdin/stdout
+# in the typical case, there is just one vacuum running at a time
+
+# The room is generated at random, on a square-cell pattern, with
+# walls and furnishings filling some of the cells.  The vacuum starts
+# at a randomized location and must finish at that some location.
+
+# The driver prompts the vacuum by sending a set of percepts and a
+# move counter.  The percepts are, in order, radar-left, radar-front,
+# radar-right, dirt, and home.  Each is a binary quantity, with 1
+# representing true and 0 representing false.  The percepts and
+# counter are space-separated and terminated by newline.  For example,
+# "1 0 0 1 0 27\n".  You can trust the percepts.  The rest of the line
+# may change in the future.
+
+# The vacuum responds by giving a command.  The valid commands are:
+# "forward\n": move forward one cell, if possible, else do not move.
+# "left\n": turn left 90 degrees, staying in the same cell.
+# "right\n": turn right 90 degrees, staying in the same cell.
+# "vacuum\n": pick up dirt in the current cell.
+# "off\n": turn off, indicating the task is completed.
+
+# For the benefit of human players, the driver will reply with "what?"
+# in case an invalid command is entered.  Robotic vacuums should not
+# need this functionality.
+
+# For the benefit of robot players, the driver will echo and ignore
+# any line starting with a "#" mark.  This allows the robot to make
+# reports to its programmer.
+
+# The driver creates a visual display of the vacuum's working, showing
+# the starting random seed, a diagram of the room and vacuum, and a
+# score to date.  By using the same random seed, different vacuums can
+# be compared.  Score is -100 per dirt remaining, +100 per dirt
+# captured, -1 per command issued, and +100 for ending in the proper
+# cell (direction faced does not matter).  Since it is anticipated
+# that all vacuums will seek out all dirt and eliminate it, the score
+# differences will be based on how quickly the task is accomplished.
+
+#------------------------------------------------------------------------
+proc rand m {
+  set device /dev/urandom             ;# /dev/random can block
+  set fileId [open $device r]
+  binary scan [read $fileId 4] i1 number
+  set clipped [expr $number % $m]
+  close $fileId
+  return $clipped }
+proc randomSeed {seed} { global RNDseed version;
+  set RNDseed $seed;  set version $seed; }
+proc random15 {} { global RNDseed; # 15 bit int: 0..32767
+  set RNDseed [expr $RNDseed * 1103515245 + 12345]; # overflows at 32 bits
+  expr int ( $RNDseed / 65536 ) % 32768 }
+proc random {low high} {
+  expr int ( ($low) + [random15] * (($high) - ($low) + 1) / 32768) }
+proc pick args {
+  if { [llength $args] == 1 } { set args [lindex $args 0] }
+  lindex $args [random 0 [expr [llength $args] - 1]] }
+proc permute args { set out "";
+  if { [llength $args] == 1 } { set args [lindex $args 0] }
+  while { [llength $args] > 0 } {
+    set nexti [random 0 [expr [llength $args] - 1]];
+    lappend out [lindex $args $nexti];
+    set args [lreplace $args $nexti $nexti];
+  }; return $out; }
+proc do {n body} { # based on p.123 of Tcl book
+  global errorInfo errorCode
+  while { $n > 0 } { incr n -1
+    set code [catch { uplevel $body } string]
+    if { $code == 1 } {
+      return -code error -errorinfo $errorInfo -errorcode $errorCode $string }
+    if { $code == 2 } { return -code return $string }
+    if { $code == 3 } { return }; # break
+    if { $code > 4 } { return -code $code $string }
+} }
+#------------------------------------------------------------------------
+proc blanket {roomIn rMin rMax cMin cMax color} { # init a rectangle
+  upvar $roomIn room
+  for { set row $rMin } { $row <= $rMax } { incr row } {
+    for { set col $cMin } { $col <= $cMax } { incr col } {
+      set room($row,$col) $color } } }
+#------------------------------------------------------------------------
+proc genRoom roomIn { # generate a room
+  upvar $roomIn room
+  set room(score) 0
+  set room(moves) 0
+  set room(rMin) [set rMin 1]
+  set room(rMax) [set rMax [rMaxPick]]
+  set room(cMin) [set cMin 1]
+  set room(cMax) [set cMax [cMaxPick]]
+  blanket room $rMin $rMax $cMin $cMax "#"
+  blanket room [expr $rMin + 1] [expr $rMax - 1] [expr $cMin + 1] [expr $cMax - 1] " "
+
+  do [pick 3 4 4 5] { # generate some furniture
+    set rW [pick 1 2 2 2 3 3]; set r0 [random $rMin+1 $rMax-$rW]; set r9 [expr $r0+$rW-1]
+    set cW [pick 1 2 2 2 3 3]; set c0 [random $cMin+1 $cMax-$cW]; set c9 [expr $c0+$cW-1]
+    blanket room $r0 $r9 $c0 $c9 "#" }
+
+  # locate the vacuum somewhere
+  set room(vacR) [set vacR [random [expr $rMin+2] [expr $rMax-2]]]
+  set room(vacC) [set vacC [random [expr $cMin+2] [expr $cMax-2]]]
+  set room(homR) $vacR
+  set room(homC) $vacC
+  blanket room [expr $vacR-1] [expr $vacR+1] [expr $vacC-1] [expr $vacC+1] " "
+  set room(vacD) [pick N S E W]
+
+  # spread dirt around the room
+  for { set row $rMin } { $row < $rMax } { incr row } {
+    for { set col $cMin } { $col < $cMax } { incr col } {
+      if { $room($row,$col) == " " && [random 0 9] == 0 } { set room($row,$col) "d" } } }
+  set room(dirt) "dirty"
+  set room(moves) 0
+  set room(name) "initial"
+}
+#------------------------------------------------------------------------
+# room layout is measured from the upper left corner (for ease of printing)
+# 11 12 13 14 15 ... 1(cMax)
+# 21 22 23 24 ...
+# 11 is the NW corner
+
+# attributes: score, name, dead, dirt, okay, moves
+proc showAtt {player attribute} { # show a room
+  upvar map$player room; return $room($attribute) }
+
+proc show roomIn { # show a room
+  upvar map$roomIn room
+  set output ""
+  set dirty 0
+  set score $room(score); # use a copy
+  set rMin $room(rMin); # integer
+  set rMax $room(rMax); # integer
+  set cMin $room(cMin); # integer
+  set cMax $room(cMax); # integer
+  set vacR $room(vacR); # integer
+  set vacC $room(vacC); # integer
+  set homR $room(homR); # integer
+  set homC $room(homC); # integer
+  set vacD $room(vacD); # N S E W
+  for { set row $rMin } { $row <= $rMax } { incr row } { set out ""
+    for { set col $cMin } { $col <= $cMax } { incr col } {
+      if ![info exists room($row,$col)] { set room($row,$col) "#" }
+      set cell $room($row,$col)
+      if { $cell == "d" } { incr score -100; set dirty 1 }
+      if { "$row,$col" == "$homR,$homC" } { set cell "o" }
+      if { "$row,$col" == "$vacR,$vacC" } {
+        if { $vacD == "N" } { set cell "A" }
+        if { $vacD == "S" } { set cell "V" }
+        if { $vacD == "E" } { set cell ">" }
+        if { $vacD == "W" } { set cell "<" }
+      }
+      append out " $cell"
+    }
+    append output "$out\n"
+  }
+  # append output " score:$score\n"
+  if { $dirty == 0 } { set room(dirt) "clean" }
+  set room(okay) "failure"; set success ""
+  if { "$dirty$vacR,$vacC" == "0$homR,$homC" } {
+    set room(okay) "success"; set success " SUCCESS!" }
+  append output " $roomIn s$room(score) m$room(moves) $room(name)"
+  if { $room(dead) == 1 } { append output " DEAD" }
+  return $output }
+#------------------------------------------------------------------------
+# this assumes all block lines are the same length
+proc showAllN ids { # wide, all on one line
+  uplevel { set output ""
+    foreach id $ids { set output [merge $output [show $id]] }
+    return $output } }
+proc showAll1 ids {
+  uplevel { set outputAll ""
+    foreach id1 $ids { # one up
+      set outputLine [show $id1]
+      lappend outputAll $outputLine }
+    join $outputAll "\n" } }
+proc showAll2 ids {
+  uplevel { set outputAll ""
+    foreach {id1 id2} $ids { # three up
+      set outputLine [show $id1]
+      if { $id2 != "" } { set outputLine [merge $outputLine [show $id2]] }
+      lappend outputAll $outputLine }
+    join $outputAll "\n" } }
+proc showAll3 ids {
+  uplevel { set outputAll ""
+    foreach {id1 id2 id3} $ids { # three up
+      set outputLine [show $id1]
+      if { $id2 != "" } { set outputLine [merge $outputLine [show $id2]] }
+      if { $id3 != "" } { set outputLine [merge $outputLine [show $id3]] }
+      lappend outputAll $outputLine }
+    join $outputAll "\n" } }
+proc showAll4 ids {
+  uplevel { set outputAll ""
+    foreach {id1 id2 id3 id4} $ids { # four up
+      set outputLine [show $id1]
+      if { $id2 != "" } { set outputLine [merge $outputLine [show $id2]] }
+      if { $id3 != "" } { set outputLine [merge $outputLine [show $id3]] }
+      if { $id4 != "" } { set outputLine [merge $outputLine [show $id4]] }
+      lappend outputAll $outputLine }
+    join $outputAll "\n" } }
+proc merge {block1 block2} {
+  set output ""
+  set max 0; foreach line1 [split $block1 "\n"] {
+    set len [string length $line1]; if { $len > $max } { set max $len } }
+  foreach line1 [split $block1 "\n"] line2 [split $block2 "\n"] {
+    lappend output "[format %-${max}s $line1] $line2" }
+  join $output "\n" }
+#------------------------------------------------------------------------
+proc move mapID {
+  set roomIn "map$mapID"
+  # send_user "$mapID: starting move ($roomIn)\n"
+  upvar $roomIn room
+
+  # compute and write the percept vector
+  # room layout is measured from the upper left corner
+  # 11 12 13 14 15 ... 1(cMax)
+  # 21 22 23 24 ...
+  # 11 is the NW corner
+  set vacR $room(vacR)
+  set vacC $room(vacC)
+  set atX $room($vacR,$vacC)
+  set atE "#"; catch { set atE $room($vacR,[expr $vacC+1]) }
+  set atN "#"; catch { set atN $room([expr $vacR-1],$vacC) }
+  set atS "#"; catch { set atS $room([expr $vacR+1],$vacC) }
+  set atW "#"; catch { set atW $room($vacR,[expr $vacC-1]) }
+  set vacD $room(vacD)
+  if { $vacD == "E" } { set atF $atE; set atL $atN; set atR $atS }
+  if { $vacD == "N" } { set atF $atN; set atL $atW; set atR $atE }
+  if { $vacD == "S" } { set atF $atS; set atL $atE; set atR $atW }
+  if { $vacD == "W" } { set atF $atW; set atL $atS; set atR $atN }
+  if { $atF == "#" } { set atF 1 } else { set atF 0 }
+  if { $atL == "#" } { set atL 1 } else { set atL 0 }
+  if { $atR == "#" } { set atR 1 } else { set atR 0 }
+  if { $atX == "d" } { set atX 1 } else { set atX 0 }
+  if { "$room(homR),$room(homC)" == "$vacR,$vacC" } { set home 1 } else { set home 0 }
+  set percept "$atL $atF $atR $atX $home $room(moves)"
+
+  if [v] { send_user "$mapID: sending ($percept)\n" }
+  send "$percept\r"
+  expect "$percept\r\n"
+  # should be an overall timeout of 1 second including comments
+  while { 1 } {
+    set expect_out(1,string) "off" ;# timeout default command
+    expect -re {[\r\n]*([^\r\n]+)[\r\n]+}
+    set cmd [string trim $expect_out(1,string)]
+    # send_user "got ($cmd)\n"
+    if ![regexp {^#} $cmd] break
+    if [v] { send_user "$mapID: $cmd\n" } } ;# print the comment
+  # send_user "broke with ($cmd)\n"
+
+  # accept the response and update the map
+  incr room(moves)
+  incr room(score) -1
+  if { $cmd == "forward" } {
+    if { $room($vacR,$vacC) == " " } { set room($vacR,$vacC) "." }; # mark progress
+    if { $atF == 1 } return
+    if { $vacD == "N" } { incr room(vacR) -1 }
+    if { $vacD == "S" } { incr room(vacR) +1 }
+    if { $vacD == "E" } { incr room(vacC) +1 }
+    if { $vacD == "W" } { incr room(vacC) -1 }
+    return
+  }
+  if { $cmd == "left" } {
+    if { $vacD == "E" } { set room(vacD) "N" }
+    if { $vacD == "N" } { set room(vacD) "W" }
+    if { $vacD == "S" } { set room(vacD) "E" }
+    if { $vacD == "W" } { set room(vacD) "S" }
+    return
+  }
+  if { $cmd == "right" } {
+    if { $vacD == "E" } { set room(vacD) "S" }
+    if { $vacD == "N" } { set room(vacD) "E" }
+    if { $vacD == "S" } { set room(vacD) "W" }
+    if { $vacD == "W" } { set room(vacD) "N" }
+    return
+  }
+  if { $cmd == "vacuum" } {
+    if { $room($vacR,$vacC) == "d" } { incr room(score) 100; set room($vacR,$vacC) " " }
+    return
+  }
+  if { $cmd == "off" } {
+    if { "$room(vacR),$room(vacC)" == "$room(homR),$room(homC)" } { incr room(score) 100 }
+    return "dead" }
+  send_user "?? got ($cmd)\n"
+  return "dead" ;# declare the broken agent to be dead
+  # send "what?\r"
+  # expect "what?\r\n"
+  # return
+}
+#------------------------------------------------------------------------
+# copy one array to create another
+proc clone {from0 to0} { upvar $from0 from; upvar $to0 to
+  foreach ele [array names from] { set to($ele) $from($ele) } }
+#------------------------------------------------------------------------
+randomSeed [exec date +%s]
+# randomSeed 20020501
+
+log_user 0
+set timeout 1
+
+if { $argc == 0 } {
+  send_user "Usage: vacd \[seed] agent1 agent2 agent3 ...\n"
+  send_user "  \[seed] is an optional random number seed.\n"
+  send_user "  each agentN is the name of a program.\n"
+  exit }
+
+set playerCount 0
+foreach agent $argv {
+  if [regexp {^[1-9][0-9]*$} $agent] { randomSeed $agent; continue }
+  incr playerCount }
+proc v args { return 1 } ;# verbosity high (default)
+if { $playerCount > 1 } { proc v args { return 0 } } ;# verbosity low
+
+# send_user "There are $playerCount players\n"
+send_user "Vacuum Driver for Robots, game # $version\n"
+
+genRoom map
+set map(dead) 0
+# send_user "[show ""]\n"; # initial map
+
+set n 0; set ids ""
+foreach agent $argv {
+  if [regexp {^[1-9][0-9]*$} $agent] continue
+  lappend ids [incr n]
+  # send_user "starting agent $n ($agent)\n"
+  set agent2 $agent
+  if { [file tail $agent2] == $agent2 } { set agent2 "./$agent2" }
+  spawn $agent2
+  set id2spawn($n) $spawn_id
+  clone map map$n
+  set map${n}(name) $agent }
+
+set deads ""
+set count 0
+set moves 0
+# set results ""
+
+proc bsws ids { # find the best score with success
+  set scores ""; set moves ""; foreach id $ids {
+    if { [uplevel 1 showAtt $id okay] != "success" } continue
+    lappend moves [uplevel 1 showAtt $id moves]
+    lappend scores [uplevel 1 showAtt $id score] }
+  set scoreMax 1; if { $scores != "" } {
+    set scoreMax [lindex [lsort -real $scores] end]
+    set moveMin [lindex [lsort -real $moves] 0]
+    set move2 [expr $moveMin * 2]
+    send_user "** moveMin: $moveMin, *2=$move2, scoreMax: $scoreMax\n" }
+  return $scoreMax }
+
+proc mygets args {
+  global expect_out
+  set expect_out(1,string) ""
+  set timeout -1
+  expect_user -re "(.*)\n"
+  set ans $expect_out(1,string)
+  return $ans }
+
+send_user "[showAll $ids]\n"
+
+while { 1 } {
+  if { [incr count -1] < 1 } {
+    if { $moves > 0 } {
+      send_user "[showAll $ids]\n"
+      # send_user "stopped agents: $deads\n"
+    }
+    send_user "press ENTER to continue, q to quit, num to fast-forward\n"
+    catch { bsws $ids }
+    set ans [mygets]
+    if [regexp {^[1-9][0-9]*$} $ans] { set count $ans }
+    if [regexp {^[Qq]} $ans] break
+  }
+  incr moves; set alive 0; set deads ""
+  foreach id $ids {
+    if { [set map${id}(dead)] == 1 } { lappend deads "$id"; continue }
+    set alive 1
+    set spawn_id $id2spawn($id)
+    if { [move $id] == "dead" } {
+      # send_user "[show $id]\n"
+      set map${id}(dead) 1
+      set m [format %3d [set map${id}(moves)]]
+      set s [format %4d [set map${id}(score)]]
+      set c [set map${id}(okay)]
+      set n [set map${id}(name)]
+      # lappend results "$id score=$s moves=$m name=$n $c"
+    }
+  }
+  if { $alive == 0 } { send_user "[showAll $ids]\n"; break }
+}
+
+set scoreMax [bsws $ids]
+
+# available showAtt attributes: score, name, dead, dirt, okay, moves
+set names ""; set nams ""; set scores ""; foreach id $ids {
+  lappend names [showAtt $id name]
+  lappend nams [string range [showAtt $id name] 0 2]
+  if { [showAtt $id okay] == "success" } { lappend scores 200 } else {
+    set score [expr 200.0 * [showAtt $id score] / $scoreMax]
+    if { $score < 0 } { set score 0 }
+    lappend scores [format %3.0f $score] }
+}
+send_user "[join $names ", "]\n"
+send_user "[join $nams ", "]\n"
+send_user "[join $scores ", "]\n"
+send_user "Done (game # $version)\n" /usr/bin/expect --
+
+#yed width is 2x cMax because we add blank columns between used columns
+proc rMaxPick args { random 12 18 } ;# max rows, including walls
+proc cMaxPick args { random 12 18 } ;# max cols, including walls
+
+proc v args { return 1 } ;# verbosity high
+#proc v args { return 0 } ;# verbosity low
+
+proc showAll ids { uplevel { showAllN $ids } } ;# three-up
+proc showAll ids { uplevel { showAll1 $ids } } ;# one-up
+proc showAll ids { uplevel { showAll2 $ids } } ;# two-up
+proc showAll ids { uplevel { showAll4 $ids } } ;# four-up
+proc showAll ids { uplevel { showAll3 $ids } } ;# three-up
+
+# Vacuum Driver, for robotic vacuums cleaning arbitrary rooms
+# written by Don Colton
+# argv is the list of executible agent programs (non-numeric names)
+# argv may (but need not) contain a numeric random number seed
+# we spawn each agent and communicate through stdin/stdout
+# in the typical case, there is just one vacuum running at a time
+
+# The room is generated at random, on a square-cell pattern, with
+# walls and furnishings filling some of the cells.  The vacuum starts
+# at a randomized location and must finish at that some location.
+
+# The driver prompts the vacuum by sending a set of percepts.  The
+# percepts are, in order, radar-left, radar-front, radar-right, dirt,
+# and home.  Each is a binary quantity, with 1 representing true and 0
+# representing false.  The percepts are space-separated and terminated
+# by newline.  For example, "1 0 0 1 0\n".
+
+# The vacuum responds by giving a command.  The valid commands are:
+# "forward\n": move forward one cell, if possible, else do not move.
+# "left\n": turn left 90 degrees, staying in the same cell.
+# "right\n": turn right 90 degrees, staying in the same cell.
+# "vacuum\n": pick up dirt in the current cell.
+# "off\n": turn off, indicating the task is completed.
+
+# For the benefit of human players, the driver will reply with "what?"
+# in case an invalid command is entered.  Robotic vacuums should not
+# need this functionality.
+
+# For the benefit of robot players, the driver will echo and ignore
+# any line starting with a "#" mark.  This allows the robot to make
+# reports to its programmer.
+
+# The driver creates a visual display of the vacuum's working, showing
+# the starting random seed, a diagram of the room and vacuum, and a
+# score to date.  By using the same random seed, different vacuums can
+# be compared.  Score is -100 per dirt remaining, +100 per dirt
+# captured, -1 per command issued, and +100 for ending in the proper
+# cell (direction faced does not matter).  Since it is anticipated
+# that all vacuums will seek out all dirt and eliminate it, the score
+# differences will be based on how quickly the task is accomplished.
+
+#------------------------------------------------------------------------
+proc rand m {
+  set device /dev/urandom             ;# /dev/random can block
+  set fileId [open $device r]
+  binary scan [read $fileId 4] i1 number
+  set clipped [expr $number % $m]
+  close $fileId
+  return $clipped }
+proc randomSeed {seed} { global RNDseed version;
+  set RNDseed $seed;  set version $seed; }
+proc random15 {} { global RNDseed; # 15 bit int: 0..32767
+  set RNDseed [expr $RNDseed * 1103515245 + 12345]; # overflows at 32 bits
+  expr int ( $RNDseed / 65536 ) % 32768 }
+proc random {low high} {
+  expr int ( ($low) + [random15] * (($high) - ($low) + 1) / 32768) }
+proc pick args {
+  if { [llength $args] == 1 } { set args [lindex $args 0] }
+  lindex $args [random 0 [expr [llength $args] - 1]] }
+proc permute args { set out "";
+  if { [llength $args] == 1 } { set args [lindex $args 0] }
+  while { [llength $args] > 0 } {
+    set nexti [random 0 [expr [llength $args] - 1]];
+    lappend out [lindex $args $nexti];
+    set args [lreplace $args $nexti $nexti];
+  }; return $out; }
+proc do {n body} { # based on p.123 of Tcl book
+  global errorInfo errorCode
+  while { $n > 0 } { incr n -1
+    set code [catch { uplevel $body } string]
+    if { $code == 1 } {
+      return -code error -errorinfo $errorInfo -errorcode $errorCode $string }
+    if { $code == 2 } { return -code return $string }
+    if { $code == 3 } { return }; # break
+    if { $code > 4 } { return -code $code $string }
+} }
+#------------------------------------------------------------------------
+proc blanket {roomIn rMin rMax cMin cMax color} { # init a rectangle
+  upvar $roomIn room
+  for { set row $rMin } { $row <= $rMax } { incr row } {
+    for { set col $cMin } { $col <= $cMax } { incr col } {
+      set room($row,$col) $color } } }
+#------------------------------------------------------------------------
+proc genRoom roomIn { # generate a room
+  upvar $roomIn room
+  set room(score) 0
+  set room(moves) 0
+  set room(rMin) [set rMin 1]
+  set room(rMax) [set rMax [rMaxPick]]
+  set room(cMin) [set cMin 1]
+  set room(cMax) [set cMax [cMaxPick]]
+  blanket room $rMin $rMax $cMin $cMax "#"
+  blanket room [expr $rMin + 1] [expr $rMax - 1] [expr $cMin + 1] [expr $cMax - 1] " "
+
+  do [pick 3 4 4 5] { # generate some furniture
+    set rW [pick 1 2 2 2 3 3]; set r0 [random $rMin+1 $rMax-$rW]; set r9 [expr $r0+$rW-1]
+    set cW [pick 1 2 2 2 3 3]; set c0 [random $cMin+1 $cMax-$cW]; set c9 [expr $c0+$cW-1]
+    blanket room $r0 $r9 $c0 $c9 "#" }
+
+  # locate the vacuum somewhere
+  set room(vacR) [set vacR [random [expr $rMin+2] [expr $rMax-2]]]
+  set room(vacC) [set vacC [random [expr $cMin+2] [expr $cMax-2]]]
+  set room(homR) $vacR
+  set room(homC) $vacC
+  blanket room [expr $vacR-1] [expr $vacR+1] [expr $vacC-1] [expr $vacC+1] " "
+  set room(vacD) [pick N S E W]
+
+  # spread dirt around the room
+  for { set row $rMin } { $row < $rMax } { incr row } {
+    for { set col $cMin } { $col < $cMax } { incr col } {
+      if { $room($row,$col) == " " && [random 0 9] == 0 } { set room($row,$col) "d" } } }
+  set room(dirt) "dirty"
+  set room(moves) 0
+  set room(name) "initial"
+}
+#------------------------------------------------------------------------
+# room layout is measured from the upper left corner (for ease of printing)
+# 11 12 13 14 15 ... 1(cMax)
+# 21 22 23 24 ...
+# 11 is the NW corner
+
+# attributes: score, name, dead, dirt, okay, moves
+proc showAtt {player attribute} { # show a room
+  upvar map$player room; return $room($attribute) }
+
+proc show roomIn { # show a room
+  upvar map$roomIn room
+  set output ""
+  set dirty 0
+  set score $room(score); # use a copy
+  set rMin $room(rMin); # integer
+  set rMax $room(rMax); # integer
+  set cMin $room(cMin); # integer
+  set cMax $room(cMax); # integer
+  set vacR $room(vacR); # integer
+  set vacC $room(vacC); # integer
+  set homR $room(homR); # integer
+  set homC $room(homC); # integer
+  set vacD $room(vacD); # N S E W
+  for { set row $rMin } { $row <= $rMax } { incr row } { set out ""
+    for { set col $cMin } { $col <= $cMax } { incr col } {
+      if ![info exists room($row,$col)] { set room($row,$col) "#" }
+      set cell $room($row,$col)
+      if { $cell == "d" } { incr score -100; set dirty 1 }
+      if { "$row,$col" == "$homR,$homC" } { set cell "o" }
+      if { "$row,$col" == "$vacR,$vacC" } {
+        if { $vacD == "N" } { set cell "A" }
+        if { $vacD == "S" } { set cell "V" }
+        if { $vacD == "E" } { set cell ">" }
+        if { $vacD == "W" } { set cell "<" }
+      }
+      append out " $cell"
+    }
+    append output "$out\n"
+  }
+  # append output " score:$score\n"
+  if { $dirty == 0 } { set room(dirt) "clean" }
+  set room(okay) "failure"; set success ""
+  if { "$dirty$vacR,$vacC" == "0$homR,$homC" } {
+    set room(okay) "success"; set success " SUCCESS!" }
+  append output " $roomIn s$room(score) m$room(moves) $room(name)"
+  if { $room(dead) == 1 } { append output " DEAD" }
+  return $output }
+#------------------------------------------------------------------------
+# this assumes all block lines are the same length
+proc showAllN ids { # wide, all on one line
+  uplevel { set output ""
+    foreach id $ids { set output [merge $output [show $id]] }
+    return $output } }
+proc showAll1 ids {
+  uplevel { set outputAll ""
+    foreach id1 $ids { # one up
+      set outputLine [show $id1]
+      lappend outputAll $outputLine }
+    join $outputAll "\n" } }
+proc showAll2 ids {
+  uplevel { set outputAll ""
+    foreach {id1 id2} $ids { # three up
+      set outputLine [show $id1]
+      if { $id2 != "" } { set outputLine [merge $outputLine [show $id2]] }
+      lappend outputAll $outputLine }
+    join $outputAll "\n" } }
+proc showAll3 ids {
+  uplevel { set outputAll ""
+    foreach {id1 id2 id3} $ids { # three up
+      set outputLine [show $id1]
+      if { $id2 != "" } { set outputLine [merge $outputLine [show $id2]] }
+      if { $id3 != "" } { set outputLine [merge $outputLine [show $id3]] }
+      lappend outputAll $outputLine }
+    join $outputAll "\n" } }
+proc showAll4 ids {
+  uplevel { set outputAll ""
+    foreach {id1 id2 id3 id4} $ids { # four up
+      set outputLine [show $id1]
+      if { $id2 != "" } { set outputLine [merge $outputLine [show $id2]] }
+      if { $id3 != "" } { set outputLine [merge $outputLine [show $id3]] }
+      if { $id4 != "" } { set outputLine [merge $outputLine [show $id4]] }
+      lappend outputAll $outputLine }
+    join $outputAll "\n" } }
+proc merge {block1 block2} {
+  set output ""
+  set max 0; foreach line1 [split $block1 "\n"] {
+    set len [string length $line1]; if { $len > $max } { set max $len } }
+  foreach line1 [split $block1 "\n"] line2 [split $block2 "\n"] {
+    lappend output "[format %-${max}s $line1] $line2" }
+  join $output "\n" }
+#------------------------------------------------------------------------
+proc move mapID {
+  set roomIn "map$mapID"
+  # send_user "$mapID: starting move ($roomIn)\n"
+  upvar $roomIn room
+
+  # compute and write the percept vector
+  # room layout is measured from the upper left corner
+  # 11 12 13 14 15 ... 1(cMax)
+  # 21 22 23 24 ...
+  # 11 is the NW corner
+  set vacR $room(vacR)
+  set vacC $room(vacC)
+  set atX $room($vacR,$vacC)
+  set atE "#"; catch { set atE $room($vacR,[expr $vacC+1]) }
+  set atN "#"; catch { set atN $room([expr $vacR-1],$vacC) }
+  set atS "#"; catch { set atS $room([expr $vacR+1],$vacC) }
+  set atW "#"; catch { set atW $room($vacR,[expr $vacC-1]) }
+  set vacD $room(vacD)
+  if { $vacD == "E" } { set atF $atE; set atL $atN; set atR $atS }
+  if { $vacD == "N" } { set atF $atN; set atL $atW; set atR $atE }
+  if { $vacD == "S" } { set atF $atS; set atL $atE; set atR $atW }
+  if { $vacD == "W" } { set atF $atW; set atL $atS; set atR $atN }
+  if { $atF == "#" } { set atF 1 } else { set atF 0 }
+  if { $atL == "#" } { set atL 1 } else { set atL 0 }
+  if { $atR == "#" } { set atR 1 } else { set atR 0 }
+  if { $atX == "d" } { set atX 1 } else { set atX 0 }
+  if { "$room(homR),$room(homC)" == "$vacR,$vacC" } { set home 1 } else { set home 0 }
+  set percept "$atL $atF $atR $atX $home"
+
+  if [v] { send_user "$mapID: sending ($percept)\n" }
+  send "$percept\r"
+  expect "$percept\r\n"
+  # should be an overall timeout of 1 second including comments
+  while { 1 } {
+    set expect_out(1,string) "off" ;# timeout default command
+    expect -re {[\r\n]*([^\r\n]+)[\r\n]+}
+    set cmd [string trim $expect_out(1,string)]
+    # send_user "got ($cmd)\n"
+    if ![regexp {^#} $cmd] break
+    if [v] { send_user "$mapID: $cmd\n" } } ;# print the comment
+  # send_user "broke with ($cmd)\n"
+
+  # accept the response and update the map
+  incr room(moves)
+  incr room(score) -1
+  if { $cmd == "forward" } {
+    if { $room($vacR,$vacC) == " " } { set room($vacR,$vacC) "." }; # mark progress
+    if { $atF == 1 } return
+    if { $vacD == "N" } { incr room(vacR) -1 }
+    if { $vacD == "S" } { incr room(vacR) +1 }
+    if { $vacD == "E" } { incr room(vacC) +1 }
+    if { $vacD == "W" } { incr room(vacC) -1 }
+    return
+  }
+  if { $cmd == "left" } {
+    if { $vacD == "E" } { set room(vacD) "N" }
+    if { $vacD == "N" } { set room(vacD) "W" }
+    if { $vacD == "S" } { set room(vacD) "E" }
+    if { $vacD == "W" } { set room(vacD) "S" }
+    return
+  }
+  if { $cmd == "right" } {
+    if { $vacD == "E" } { set room(vacD) "S" }
+    if { $vacD == "N" } { set room(vacD) "E" }
+    if { $vacD == "S" } { set room(vacD) "W" }
+    if { $vacD == "W" } { set room(vacD) "N" }
+    return
+  }
+  if { $cmd == "vacuum" } {
+    if { $room($vacR,$vacC) == "d" } { incr room(score) 100; set room($vacR,$vacC) " " }
+    return
+  }
+  if { $cmd == "off" } {
+    if { "$room(vacR),$room(vacC)" == "$room(homR),$room(homC)" } { incr room(score) 100 }
+    return "dead" }
+  send_user "?? got ($cmd)\n"
+  return "dead" ;# declare the broken agent to be dead
+  # send "what?\r"
+  # expect "what?\r\n"
+  # return
+}
+#------------------------------------------------------------------------
+# copy one array to create another
+proc clone {from0 to0} { upvar $from0 from; upvar $to0 to
+  foreach ele [array names from] { set to($ele) $from($ele) } }
+#------------------------------------------------------------------------
+randomSeed [exec date +%s]
+# randomSeed 20020501
+
+log_user 0
+set timeout 1
+
+if { $argc == 0 } {
+  send_user "Usage: vacd \[seed] agent1 agent2 agent3 ...\n"
+  send_user "  \[seed] is an optional random number seed.\n"
+  send_user "  each agentN is the name of a program.\n"
+  exit }
+
+set playerCount 0
+foreach agent $argv {
+  if [regexp {^[1-9][0-9]*$} $agent] { randomSeed $agent; continue }
+  incr playerCount
+}
+
+# send_user "There are $playerCount players\n"
+send_user "Vacuum Driver for Robots, game # $version\n"
+
+genRoom map
+set map(dead) 0
+# send_user "[show ""]\n"; # initial map
+
+set n 0; set ids ""
+foreach agent $argv {
+  if [regexp {^[1-9][0-9]*$} $agent] continue
+  lappend ids [incr n]
+  # send_user "starting agent $n ($agent)\n"
+  set agent2 $agent
+  if { [file tail $agent2] == $agent2 } { set agent2 "./$agent2" }
+  spawn $agent2
+  set id2spawn($n) $spawn_id
+  clone map map$n
+  set map${n}(name) $agent }
+
+set deads ""
+set count 0
+set moves 0
+# set results ""
+
+proc bsws ids { # find the best score with success
+  set scores ""; set moves ""; foreach id $ids {
+    if { [uplevel 1 showAtt $id okay] != "success" } continue
+    lappend moves [uplevel 1 showAtt $id moves]
+    lappend scores [uplevel 1 showAtt $id score] }
+  set scoreMax 1; if { $scores != "" } {
+    set scoreMax [lindex [lsort -real $scores] end]
+    set moveMin [lindex [lsort -real $moves] 0]
+    set move2 [expr $moveMin * 2]
+    send_user "** moveMin: $moveMin, *2=$move2, scoreMax: $scoreMax\n" }
+  return $scoreMax }
+
+proc mygets args {
+  global expect_out
+  set expect_out(1,string) ""
+  set timeout -1
+  expect_user -re "(.*)\n"
+  set ans $expect_out(1,string)
+  return $ans }
+
+send_user "[showAll $ids]\n"
+
+while { 1 } {
+  if { [incr count -1] < 1 } {
+    if { $moves > 0 } {
+      send_user "[showAll $ids]\n"
+      # send_user "stopped agents: $deads\n"
+    }
+    send_user "press ENTER to continue, q to quit, num to fast-forward\n"
+    catch { bsws $ids }
+    set ans [mygets]
+    if [regexp {^[1-9][0-9]*$} $ans] { set count $ans }
+    if [regexp {^[Qq]} $ans] break
+  }
+  incr moves; set alive 0; set deads ""
+  foreach id $ids {
+    if { [set map${id}(dead)] == 1 } { lappend deads "$id"; continue }
+    set alive 1
+    set spawn_id $id2spawn($id)
+    if { [move $id] == "dead" } {
+      # send_user "[show $id]\n"
+      set map${id}(dead) 1
+      set m [format %3d [set map${id}(moves)]]
+      set s [format %4d [set map${id}(score)]]
+      set c [set map${id}(okay)]
+      set n [set map${id}(name)]
+      # lappend results "$id score=$s moves=$m name=$n $c"
+    }
+  }
+  if { $alive == 0 } { send_user "[showAll $ids]\n"; break }
+}
+
+set scoreMax [bsws $ids]
+
+# available showAtt attributes: score, name, dead, dirt, okay, moves
+set names ""; set nams ""; set scores ""; foreach id $ids {
+  lappend names [showAtt $id name]
+  lappend nams [string range [showAtt $id name] 0 2]
+  if { [showAtt $id okay] == "success" } { lappend scores 150 } else {
+    set score [expr 150.0 * [showAtt $id score] / $scoreMax]
+    if { $score < 0 } { set score 0 }
+    lappend scores [format %3.0f $score] }
+}
+send_user "[join $names ", "]\n"
+send_user "[join $nams ", "]\n"
+send_user "[join $scores ", "]\n"
+send_user "Done (game # $version)\n"
